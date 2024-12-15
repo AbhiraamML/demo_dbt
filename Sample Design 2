@@ -1,0 +1,162 @@
+1. Enhance the YAML Configuration
+Store all failure codes and associated rules in a structured way in the YAML file:
+
+yaml
+Copy code
+control_procedures:
+  - cp_id: 100
+    name: "Database Backup Hygiene"
+    rules:
+      - id: "rule_1"
+        condition: "backup_status != 'successful'"
+        failure_code: "no_successful_backup"
+      - id: "rule_2"
+        condition: "last_backup_date < date_sub(current_date, interval 7 day)"
+        failure_code: "backup_outdated"
+      - id: "rule_3"
+        condition: "backup_waived = true"
+        failure_code: "waiver"
+
+2. Use a Macro for Dynamic Rule and Failure Code Application
+A DBT macro can dynamically iterate through the rules in the YAML configuration and apply the logic.
+
+Macro to Dynamically Evaluate Rules:
+sql
+Copy code
+{% macro apply_cp_rules(cp_config) %}
+SELECT
+    app_id,
+    '{{ cp_config["cp_id"] }}' AS cp_id,
+    CASE
+        {% for rule in cp_config["rules"] %}
+        WHEN {{ rule.condition }} THEN '{{ rule.failure_code }}'
+        {% endfor %}
+        ELSE 'pass'
+    END AS compliance_status,
+    CASE
+        {% for rule in cp_config["rules"] %}
+        WHEN {{ rule.condition }} THEN '{{ rule.id }}'
+        {% endfor %}
+        ELSE NULL
+    END AS rule_id
+FROM {{ ref('base_db_backups') }}
+{% endmacro %}
+The rule_id column ensures traceability for identifying which rule was applied for the failure.
+
+3. Implement the Macro in the Model
+Use the macro in a DBT model to apply rules dynamically:
+
+sql
+Copy code
+-- models/evaluate_cp_logic.sql
+{{ apply_cp_rules(var('control_procedure_config')) }}
+Pass the YAML configuration as a variable:
+
+bash
+Copy code
+dbt run --vars '{"control_procedure_config": {{ read_yaml('control_procedures.yml')["cp_id_100"] }} }'
+
+
+4. Handle Multiple Failure Codes Per Rule Dynamically
+If a single rule can have multiple failure codes, extend the YAML and the macro:
+
+Updated YAML Example:
+yaml
+Copy code
+control_procedures:
+  - cp_id: 100
+    name: "Database Backup Hygiene"
+    rules:
+      - id: "rule_1"
+        condition: "backup_status != 'successful'"
+        failure_codes:
+          - "no_successful_backup"
+          - "missing_data"
+      - id: "rule_2"
+        condition: "last_backup_date < date_sub(current_date, interval 7 day)"
+        failure_codes:
+          - "backup_outdated"
+          - "policy_violation"
+Macro to Handle Multiple Failure Codes:
+sql
+Copy code
+{% macro apply_cp_rules(cp_config) %}
+SELECT
+    app_id,
+    '{{ cp_config["cp_id"] }}' AS cp_id,
+    ARRAY_AGG(
+        CASE
+            {% for rule in cp_config["rules"] %}
+            WHEN {{ rule.condition }} THEN '{{ rule.failure_codes | join("', '") }}'
+            {% endfor %}
+        END
+    ) AS failure_codes_array,
+    CASE
+        {% for rule in cp_config["rules"] %}
+        WHEN {{ rule.condition }} THEN '{{ rule.id }}'
+        {% endfor %}
+        ELSE NULL
+    END AS rule_id
+FROM {{ ref('base_db_backups') }}
+{% endmacro %}
+This macro creates an array of failure codes for each app based on the rules that apply.
+
+5. Enable Failure Code Tracing in Final Aggregation
+Ensure the final master report includes details of failure codes, rule IDs, and compliance status for transparency:
+
+sql
+Copy code
+-- models/master_compliance_report.sql
+WITH evaluated_rules AS (
+    {{ apply_cp_rules(var('control_procedure_config')) }}
+)
+SELECT
+    app_id,
+    cp_id,
+    compliance_status,
+    rule_id,
+    STRING_AGG(failure_codes_array, ', ') AS failure_codes,
+    report_date
+FROM evaluated_rules
+GROUP BY app_id, cp_id, compliance_status, rule_id, report_date
+This ensures:
+
+Multiple failure codes for each rule are captured.
+You maintain traceability to identify the specific rule that caused the failure.
+
+
+6. Automate Configuration Loading
+Instead of manually passing YAML variables, automate the loading of all CP configurations into DBT models using a pre-run Python script or a macro.
+
+Python Script Example:
+python
+Copy code
+import yaml
+
+# Load the YAML configuration
+with open("control_procedures.yml", "r") as file:
+    config = yaml.safe_load(file)
+
+# Pass configuration to DBT via an environment variable
+print("Control procedure config loaded successfully.")
+Run the script before executing DBT commands to pass the configuration.
+
+7. Testing New Rules and Failure Codes
+DBT Tests: Write tests to validate that new rules and failure codes are being applied correctly:
+
+yaml
+Copy code
+tests:
+  - models/evaluate_cp_logic:
+      - not_null:
+          column_name: failure_codes
+      - unique:
+          column_name: rule_id
+Incremental Updates: Test on small datasets and use incremental builds for scalable deployment.
+
+Result:
+By dynamically integrating failure codes and rules in this way:
+
+Adding new CPs or failure codes requires only updating the YAML configuration.
+The DBT models remain generic and reusable for any new logic.
+Traceability is ensured by including rule IDs and failure codes in the output.
